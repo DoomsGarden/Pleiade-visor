@@ -21,6 +21,7 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
+      actions: read
     outputs:
       deploy: ${{ steps.release.outputs.deploy }}
     steps:
@@ -42,9 +43,25 @@ jobs:
             echo '::error::No hay una etiqueta válida para publicar.'
             exit 1
           fi
-          published=$(gh api "repos/$engine/releases/tags/$tag" \
-            --jq 'select(.draft == false and .published_at != null) | .tag_name')
-          test "$published" = "$tag"
+          release_json=$(gh api "repos/$engine/releases/tags/$tag")
+          jq -e --arg tag "$tag" '
+            .tag_name == $tag and .draft == false and .published_at != null
+          ' <<< "$release_json" > /dev/null
+          commit=$(gh api "repos/$engine/commits/refs/tags/$tag" --jq .sha)
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+          if [[ ! "$tag" < v0.000.00.019 ]]; then
+            test "$commit" = "$(jq -r .target_commitish <<< "$release_json")"
+            checks_run=$(jq -r .body <<< "$release_json" |
+              sed -nE "s|^\[Engine checks\]\($GITHUB_SERVER_URL/$engine/actions/runs/([0-9]+)\)$|\1|p")
+            [[ "$checks_run" =~ ^[0-9]+$ ]]
+            gh api "repos/$engine/actions/runs/$checks_run" | jq -e --arg sha "$commit" '
+              .head_sha == $sha and
+              .path == ".github/workflows/engine-checks.yml" and
+              (.head_branch == "main" or .head_branch == "arquitectura-014") and
+              (.event == "push" or .event == "workflow_dispatch") and
+              .status == "completed" and .conclusion == "success"
+            ' > /dev/null
+          fi
           manifest=$(mktemp)
           status=$(curl -sS --retry 2 -o "$manifest" -w '%{http_code}' \
             "https://doomsgarden.github.io/Pleiade-visor/assets/manifest.json?workflow=$GITHUB_RUN_ID")
@@ -59,27 +76,30 @@ jobs:
             printf 'Visor listo en la versión %s.\n' "$deployed" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          printf 'deploy=true\ntag=%s\n' "$tag" >> "$GITHUB_OUTPUT"
+          printf 'deploy=true\ntag=%s\ncommit=%s\n' "$tag" "$commit" >> "$GITHUB_OUTPUT"
           printf 'Despliegue de [la versión %s](https://github.com/%s/releases/tag/%s).\n' \
             "$tag" "$engine" "$tag" >> "$GITHUB_STEP_SUMMARY"
+          printf 'Commit %s\n' "$commit" >> "$GITHUB_STEP_SUMMARY"
       - name: Descargar el visor de la versión publicada
         if: steps.release.outputs.deploy == 'true'
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: DoomsGarden/Pleiade
-          ref: refs/tags/${{ steps.release.outputs.tag }}
+          ref: ${{ steps.release.outputs.commit }}
           sparse-checkout: dist
           persist-credentials: false
       - name: Validar archivos y versión
         if: steps.release.outputs.deploy == 'true'
         env:
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          EXPECTED_COMMIT: ${{ steps.release.outputs.commit }}
         run: |
           set -euo pipefail
           for file in index.html app.js style.css assets/manifest.json assets/scene.json assets/shaders.json; do
             test -s "dist/$file"
           done
           test -z "$(find dist -type l -print -quit)"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_COMMIT"
           test "$(jq -r .viewer_version dist/assets/manifest.json)" = "${RELEASE_TAG#v}"
           if [[ -e dist/map-editor.js || -e dist/map-project.js ]] || grep -q 'data-map-editor' dist/index.html; then
             echo '::error::El paquete contiene el editor privado.'
