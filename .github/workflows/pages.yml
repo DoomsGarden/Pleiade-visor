@@ -1,10 +1,13 @@
 name: Publicar visor en GitHub Pages
 
 on:
-  push:
-    branches: [main]
-    paths: [dist/**, .github/workflows/pages.yml]
+  schedule:
+    - cron: '17 * * * *'
   workflow_dispatch:
+    inputs:
+      release:
+        description: Etiqueta publicada del motor. Vacío usa la versión más reciente.
+        type: string
 
 permissions: {}
 
@@ -15,23 +18,83 @@ concurrency:
 jobs:
   prepare:
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     permissions:
       contents: read
+    outputs:
+      deploy: ${{ steps.release.outputs.deploy }}
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Consultar las versiones publicadas del motor
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED: ${{ inputs.release }}
+        run: |
+          set -euo pipefail
+          engine=DoomsGarden/Pleiade
+          tag="$REQUESTED"
+          if [[ -z "$tag" ]]; then
+            tag=$(gh release list --repo "$engine" --limit 50 --json tagName,isDraft,publishedAt --jq '
+              .[] | select(.isDraft == false and .publishedAt != null) | .tagName
+            ' | awk '/^v[0-9][.][0-9][0-9][0-9][.][0-9][0-9][.][0-9][0-9][0-9]$/' | sort -V | tail -n 1)
+          fi
+          if [[ ! "$tag" =~ ^v[0-9]\.[0-9]{3}\.[0-9]{2}\.[0-9]{3}$ ]]; then
+            echo '::error::No hay una etiqueta válida para publicar.'
+            exit 1
+          fi
+          published=$(gh api "repos/$engine/releases/tags/$tag" \
+            --jq 'select(.draft == false and .published_at != null) | .tag_name')
+          test "$published" = "$tag"
+          manifest=$(mktemp)
+          status=$(curl -sS --retry 2 -o "$manifest" -w '%{http_code}' \
+            "https://doomsgarden.github.io/Pleiade-visor/assets/manifest.json?workflow=$GITHUB_RUN_ID")
+          deployed=''
+          case "$status" in
+            200) deployed="v$(jq -er '.viewer_version' "$manifest")"
+                 [[ "$deployed" =~ ^v[0-9]\.[0-9]{3}\.[0-9]{2}\.[0-9]{3}$ ]] ;;
+            404) ;;
+            *) echo "::error::El visor respondió HTTP $status"; exit 1 ;;
+          esac
+          if [[ "$tag" == "$deployed" || ( -z "$REQUESTED" && "$tag" < "$deployed" ) ]]; then
+            printf 'Visor listo en la versión %s.\n' "$deployed" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          printf 'deploy=true\ntag=%s\n' "$tag" >> "$GITHUB_OUTPUT"
+          printf 'Despliegue de [la versión %s](https://github.com/%s/releases/tag/%s).\n' \
+            "$tag" "$engine" "$tag" >> "$GITHUB_STEP_SUMMARY"
+      - name: Descargar el visor de la versión publicada
+        if: steps.release.outputs.deploy == 'true'
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          repository: DoomsGarden/Pleiade
+          ref: refs/tags/${{ steps.release.outputs.tag }}
+          sparse-checkout: dist
           persist-credentials: false
-      - run: |
-          test -s dist/index.html
-          test -s dist/assets/manifest.json
+      - name: Validar archivos y versión
+        if: steps.release.outputs.deploy == 'true'
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          for file in index.html app.js style.css assets/manifest.json assets/scene.json assets/shaders.json; do
+            test -s "dist/$file"
+          done
           test -z "$(find dist -type l -print -quit)"
-      - uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4
+          test "$(jq -r .viewer_version dist/assets/manifest.json)" = "${RELEASE_TAG#v}"
+          if [[ -e dist/map-editor.js || -e dist/map-project.js ]] || grep -q 'data-map-editor' dist/index.html; then
+            echo '::error::El paquete contiene el editor privado.'
+            exit 1
+          fi
+      - if: steps.release.outputs.deploy == 'true'
+        uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4
         with:
           path: dist
 
   deploy:
     needs: prepare
+    if: needs.prepare.outputs.deploy == 'true' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     permissions:
       pages: write
       id-token: write
